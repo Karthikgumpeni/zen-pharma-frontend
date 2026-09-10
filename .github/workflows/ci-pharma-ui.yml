@@ -159,10 +159,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+
+        
+
       - name: Set short image tag
         id: tag
         run: echo "image_tag=sha-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+      - name: Debug GitHub Context
+  run: |
+    echo "Repository: ${{ github.repository }}"
+    echo "Ref: ${{ github.ref }}"
 
+    
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
