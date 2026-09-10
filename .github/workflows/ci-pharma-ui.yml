@@ -188,7 +188,7 @@ jobs:
       - name: Debug GitHub OIDC Claims
         uses: github/actions-oidc-debugger@v1
         with:
-            audience: sts.amazonaws.com
+          audience: sts.amazonaws.com
 
       - name: Debug GitHub Context
         run: |
