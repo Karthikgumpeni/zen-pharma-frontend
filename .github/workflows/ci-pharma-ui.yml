@@ -1,0 +1,319 @@
+name: CI/CD — pharma-ui
+
+# Triggers on push to develop / release branches only
+# PRs → lint, test, security run but no Docker build.
+# PROD promotion → promote-prod-pharma-ui.yml (workflow_dispatch)
+
+on:
+  push:
+    branches: [develop, 'release/**']
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch to build'
+        required: false
+        default: 'develop'
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+  actions: read
+  pull-requests: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: pharma-ui
+  GITOPS_REPO: ${{ vars.GITOPS_REPO }}
+
+jobs:
+  # ── 1. Lint ───────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: ESLint
+        run: ./node_modules/.bin/eslint src/ --ext .js,.jsx
+
+  # ── 2. Unit Tests with Coverage ──────────────────────────────────────────
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npm test -- --ci
+        env:
+          CI: true
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 3
+
+  # ── 3. Security (CodeQL + Semgrep + npm audit) ────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+          queries: security-extended
+
+      - name: CodeQL — Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:javascript
+
+      - name: Semgrep SAST (javascript · nodejs · owasp-top-ten)
+        uses: semgrep/semgrep-action@v1
+        continue-on-error: true
+        with:
+          config: >-
+            p/javascript
+            p/nodejs
+            p/owasp-top-ten
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: npm audit (HIGH/CRITICAL → fail)
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+  # ── 4. Build React App ───────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build production bundle
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact
+          path: build/
+
+  # ── 5. Docker Build, Trivy Scan & Push to ECR ────────────────────────────
+  docker-build-push:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set short image tag
+        id: tag
+        run: echo "image_tag=sha-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/pharma-dev-github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.image_tag }} \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest .
+
+      - name: Trivy — scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.image_tag }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+          exit-code: '0'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-pharma-ui
+
+      - name: Push image to ECR
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.image_tag }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+  # ── 6. Deploy — DEV (direct push to gitops) ──────────────────────────────
+  deploy-dev:
+    name: Deploy — DEV
+    needs: docker-build-push
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: _gitops
+
+      - name: Install yq
+        run: |
+          wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
+
+      - name: Update image tag — DEV
+        env:
+          IMAGE_TAG: ${{ needs.docker-build-push.outputs.image_tag }}
+        run: |
+          yq e ".image.tag = \"${IMAGE_TAG}\"" -i \
+            "_gitops/envs/dev/values-pharma-ui.yaml"
+          cd _gitops
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --staged --quiet && echo "Already up to date" && exit 0
+          git commit -m "ci(dev): update pharma-ui → ${IMAGE_TAG}"
+          git push
+
+  # ── 7. Open PR — QA Promotion ─────────────────────────────────────────────
+  open-qa-pr:
+    name: Open PR — QA Promotion
+    needs: [docker-build-push, deploy-dev]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: _gitops
+
+      - name: Install yq
+        run: |
+          wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
+
+      - name: Create branch, commit, open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          IMAGE_TAG: ${{ needs.docker-build-push.outputs.image_tag }}
+          REF_NAME: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          GITOPS_REPO_NAME: ${{ env.GITOPS_REPO }}
+        run: |
+          VALUES="_gitops/envs/qa/values-pharma-ui.yaml"
+          BRANCH="promote/qa/pharma-ui/${IMAGE_TAG}"
+
+          if [[ ! -f "$VALUES" ]]; then
+            echo "::warning::$VALUES not found — QA PR skipped."
+            exit 0
+          fi
+
+          cd _gitops
+          git checkout -b "$BRANCH"
+          yq e ".image.tag = \"${IMAGE_TAG}\"" -i "envs/qa/values-pharma-ui.yaml"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          if git diff --staged --quiet; then
+            echo "QA already has this image — no PR needed"
+            exit 0
+          fi
+          git commit -m "promote(qa): pharma-ui → ${IMAGE_TAG}"
+          git push --force-with-lease origin "$BRANCH"
+
+          printf '%s\n' \
+            "## QA Promotion" \
+            "" \
+            "Service : pharma-ui" \
+            "Image   : ${IMAGE_TAG}" \
+            "Branch  : ${REF_NAME}" \
+            "Actor   : ${ACTOR}" \
+            "Build   : ${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}" \
+            "" \
+            "## Checklist" \
+            "- [ ] DEV smoke test passed (see build link above)" \
+            "- [ ] No unexpected config changes in this diff" \
+            "- [ ] QA team sign-off" \
+            "" \
+            "Merging this PR updates envs/qa/values-pharma-ui.yaml." \
+            "ArgoCD (pharma-qa) auto-syncs on merge." > /tmp/pr-body.md
+
+          PR_URL=$(gh pr view --repo "$GITOPS_REPO_NAME" --head "$BRANCH" --json url -q .url 2>/dev/null || true)
+          if [[ -n "$PR_URL" ]]; then
+            echo "::notice title=QA PR already open::${PR_URL}"
+          else
+            gh pr create \
+              --repo "$GITOPS_REPO_NAME" \
+              --title "promote(qa): pharma-ui → ${IMAGE_TAG}" \
+              --body-file /tmp/pr-body.md \
+              --base main \
+              --head "$BRANCH"
+            echo "::notice title=QA PR opened::Review and merge in ${GITOPS_REPO_NAME} to deploy to QA."
+          fi
